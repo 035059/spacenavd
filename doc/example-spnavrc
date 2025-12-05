@@ -144,3 +144,32 @@
 # the re-centering power of the device.
 #
 #repeat-interval = -1
+
+
+# Profile support
+# Profiles allow you to define multiple configuration files and switch between
+# them using spacemouse buttons. Each profile has a dedicated button that toggles
+# between that profile and the default profile. No persistence across restarts -
+# the daemon always starts with the default profile (/etc/spnavrc).
+#
+# Define profiles (in main /etc/spnavrc only):
+#    profile = <name> <path>
+# Where <name> is a descriptive name and <path> is the path to the profile config file.
+#
+# Bind buttons to toggle profiles:
+#    bnactN = profile-M
+# Where N is the button number and M is the profile index (0-15).
+#
+# Examples:
+#profile = blender /etc/spnavrc.blender
+#profile = cad /etc/spnavrc.cad
+#profile = gimp /etc/spnavrc.gimp
+#
+# Button bindings (toggle profiles):
+#bnact10 = profile-0    # Toggle blender profile
+#bnact11 = profile-1    # Toggle CAD profile
+#bnact12 = profile-2    # Toggle GIMP profile
+#
+# Profile files can contain any configuration options except profile definitions
+# themselves. When a profile is active, its settings override the default settings.
+# Pressing the profile button again returns to the default profile.

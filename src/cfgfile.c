@@ -32,6 +32,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 struct cfg cfg, prev_cfg;
 
+/* profile management */
+struct cfg default_cfg_backup;	/* pristine copy of default config */
+int current_profile = -1;		/* -1 = default, 0-15 = profile index */
+
 /* all parsable config options... some of them might map to the same cfg field */
 enum {
 	CFG_REPEAT,
@@ -48,6 +52,7 @@ enum {
 
 	/* debug options, not part of the protocol, can change at any time */
 	CFG_KBMAP_USE_X11,
+	CFG_PROFILE,
 
 	NUM_CFG_OPTIONS
 };
@@ -117,6 +122,13 @@ void default_cfg(struct cfg *cfg)
 		cfg->devname[i] = 0;
 		cfg->devid[i][0] = cfg->devid[i][1] = -1;
 	}
+
+	/* initialize profiles */
+	cfg->num_profiles = 0;
+	for(i=0; i<MAX_PROFILES; i++) {
+		cfg->profiles[i].name = 0;
+		cfg->profiles[i].path = 0;
+	}
 }
 
 void unlock_cfgfile(int fd)
@@ -144,7 +156,19 @@ static const char *bool_str[] = {
 	0
 };
 
-int read_cfg(const char *fname, struct cfg *cfg)
+static void free_profile_memory(struct cfg *cfg)
+{
+	int i;
+	for(i=0; i<MAX_PROFILES; i++) {
+		free(cfg->profiles[i].name);
+		free(cfg->profiles[i].path);
+		cfg->profiles[i].name = 0;
+		cfg->profiles[i].path = 0;
+	}
+	cfg->num_profiles = 0;
+}
+
+static int read_cfg_internal(const char *fname, struct cfg *cfg, int reset_defaults)
 {
 	FILE *fp;
 	int i, c, fd;
@@ -153,9 +177,14 @@ int read_cfg(const char *fname, struct cfg *cfg)
 	int num_devid = 0;
 	struct cfgline *lptr;
 
-	default_cfg(cfg);
+	if(reset_defaults) {
+		/* free any previously allocated profiles before resetting config */
+		free_profile_memory(cfg);
+		default_cfg(cfg);
+	}
 
-	logmsg(LOG_INFO, "reading config file: %s\n", fname);
+	logmsg(LOG_INFO, "reading config file: %s%s\n", fname,
+		reset_defaults ? "" : " (overlay mode)");
 	if(!(fp = fopen(fname, "r"))) {
 		logmsg(LOG_WARNING, "failed to open config file %s: %s. using defaults.\n", fname, strerror(errno));
 		return -1;
@@ -457,6 +486,57 @@ int read_cfg(const char *fname, struct cfg *cfg)
 			lptr->opt = CFG_SERIAL;
 			strncpy(cfg->serial_dev, val_str, PATH_MAX - 1);
 
+		} else if(strcmp(key_str, "profile") == 0) {
+			char *profile_name, *profile_path;
+			char *dir;
+
+			lptr->opt = CFG_PROFILE;
+			profile_name = val_str;
+			profile_path = strtok(0, " =\n\t\r");
+
+			if(!profile_path) {
+				logmsg(LOG_WARNING, "profile definition requires both name and path\n");
+				continue;
+			}
+
+			if(cfg->num_profiles >= MAX_PROFILES) {
+				logmsg(LOG_WARNING, "too many profiles defined (max %d)\n", MAX_PROFILES);
+				continue;
+			}
+
+			/* handle relative paths by prepending config file directory */
+			if(profile_path[0] != '/') {
+				char abs_path[PATH_MAX];
+				/* get directory of config file */
+				dir = strdup(fname);
+				if(dir) {
+					char *sep = strrchr(dir, '/');
+					if(sep) {
+						*sep = '\0';
+						snprintf(abs_path, sizeof abs_path, "%s/%s", dir, profile_path);
+						profile_path = abs_path;
+					}
+					free(dir);
+				}
+			}
+
+			/* allocate and store profile name and path */
+			cfg->profiles[cfg->num_profiles].name = strdup(profile_name);
+			cfg->profiles[cfg->num_profiles].path = strdup(profile_path);
+
+			if(!cfg->profiles[cfg->num_profiles].name || !cfg->profiles[cfg->num_profiles].path) {
+				logmsg(LOG_WARNING, "failed to allocate memory for profile %d\n", cfg->num_profiles);
+				free(cfg->profiles[cfg->num_profiles].name);
+				free(cfg->profiles[cfg->num_profiles].path);
+				cfg->profiles[cfg->num_profiles].name = 0;
+				cfg->profiles[cfg->num_profiles].path = 0;
+				continue;
+			}
+
+			logmsg(LOG_INFO, "registered profile %d: %s -> %s\n", cfg->num_profiles,
+				cfg->profiles[cfg->num_profiles].name, cfg->profiles[cfg->num_profiles].path);
+			cfg->num_profiles++;
+
 		} else if(strcmp(key_str, "device-id") == 0) {
 			unsigned int vendor, prod;
 			lptr->opt = CFG_DEVID;
@@ -477,6 +557,18 @@ int read_cfg(const char *fname, struct cfg *cfg)
 	unlock_cfgfile(fd);
 	fclose(fp);
 	return 0;
+}
+
+/* read config with reset to defaults (normal mode) */
+int read_cfg(const char *fname, struct cfg *cfg)
+{
+	return read_cfg_internal(fname, cfg, 1);
+}
+
+/* read config without reset (overlay mode for profiles) */
+static int read_cfg_overlay(const char *fname, struct cfg *cfg)
+{
+	return read_cfg_internal(fname, cfg, 0);
 }
 
 
@@ -711,6 +803,88 @@ int write_cfg(const char *fname, struct cfg *cfg)
 	return 0;
 }
 
+/* profile switching */
+extern void cfg_changed(void);
+
+int switch_profile(int profile_idx)
+{
+	int i;
+	struct cfg new_cfg;
+
+	/* validate profile index */
+	if(profile_idx < -1 || profile_idx >= MAX_PROFILES) {
+		logmsg(LOG_ERR, "invalid profile index: %d\n", profile_idx);
+		return -1;
+	}
+
+	/* check if already on requested profile (no-op) */
+	if(current_profile == profile_idx) {
+		return 0;
+	}
+
+	/* switching to default profile */
+	if(profile_idx == -1) {
+		logmsg(LOG_INFO, "==== Switching to DEFAULT profile ====\n");
+		/* restore from backup, preserving profile definitions */
+		cfg = default_cfg_backup;
+		current_profile = -1;
+		cfg_changed();
+		return 0;
+	}
+
+	/* switching to named profile */
+	if(profile_idx >= default_cfg_backup.num_profiles) {
+		logmsg(LOG_ERR, "profile %d not defined\n", profile_idx);
+		return -1;
+	}
+
+	logmsg(LOG_INFO, "==== Switching to profile: %s ====\n",
+		default_cfg_backup.profiles[profile_idx].name);
+	logmsg(LOG_INFO, "Profile path: %s\n",
+		default_cfg_backup.profiles[profile_idx].path);
+
+	/* start with main config as base, then overlay profile settings */
+	new_cfg = default_cfg_backup;
+	if(read_cfg_overlay(default_cfg_backup.profiles[profile_idx].path, &new_cfg) != 0) {
+		logmsg(LOG_ERR, "failed to load profile config from %s\n",
+			default_cfg_backup.profiles[profile_idx].path);
+		return -1;
+	}
+
+	/* preserve profile definitions from default config */
+	new_cfg.num_profiles = default_cfg_backup.num_profiles;
+	for(i=0; i<default_cfg_backup.num_profiles; i++) {
+		new_cfg.profiles[i] = default_cfg_backup.profiles[i];
+	}
+
+	/* apply new config */
+	/* free old kbmap strings */
+	for(i=0; i<MAX_BUTTONS; i++) {
+		if(cfg.kbmap_str[i] && cfg.kbmap_str[i] != default_cfg_backup.kbmap_str[i]) {
+			free(cfg.kbmap_str[i]);
+		}
+	}
+
+	cfg = new_cfg;
+	current_profile = profile_idx;
+	cfg_changed();
+
+	return 0;
+}
+
+int get_current_profile(void)
+{
+	return current_profile;
+}
+
+const char *get_profile_name(int profile_idx)
+{
+	if(profile_idx < 0 || profile_idx >= default_cfg_backup.num_profiles) {
+		return NULL;
+	}
+	return default_cfg_backup.profiles[profile_idx].name;
+}
+
 static struct {
 	const char *name;
 	int act;
@@ -722,6 +896,22 @@ static struct {
 	{"disable-rotation", BNACT_DISABLE_ROTATION},
 	{"disable-translation", BNACT_DISABLE_TRANSLATION},
 	{"dominant-axis", BNACT_DOMINANT_AXIS},
+	{"profile-0", BNACT_PROFILE_0},
+	{"profile-1", BNACT_PROFILE_1},
+	{"profile-2", BNACT_PROFILE_2},
+	{"profile-3", BNACT_PROFILE_3},
+	{"profile-4", BNACT_PROFILE_4},
+	{"profile-5", BNACT_PROFILE_5},
+	{"profile-6", BNACT_PROFILE_6},
+	{"profile-7", BNACT_PROFILE_7},
+	{"profile-8", BNACT_PROFILE_8},
+	{"profile-9", BNACT_PROFILE_9},
+	{"profile-10", BNACT_PROFILE_10},
+	{"profile-11", BNACT_PROFILE_11},
+	{"profile-12", BNACT_PROFILE_12},
+	{"profile-13", BNACT_PROFILE_13},
+	{"profile-14", BNACT_PROFILE_14},
+	{"profile-15", BNACT_PROFILE_15},
 	{0, 0}
 };
 
